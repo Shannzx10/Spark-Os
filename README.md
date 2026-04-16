@@ -126,7 +126,7 @@ sh scripts/build-initrd.sh
 sh scripts/build-iso.sh
 
 # Jalankan
-qemu-system-x86_64 -cdrom spark-os-1.0.iso -m 512M -net nic -net user
+qemu-system-x86_64 -cdrom spark-os-1.0.iso -m 512M -net nic -net user -nographic
 ```
 
 ---
