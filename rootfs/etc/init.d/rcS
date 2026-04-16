@@ -1,0 +1,60 @@
+#!/bin/sh
+# /etc/init.d/rcS - Main system initialization script
+
+# Mount virtual filesystems
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+
+# Set hostname
+hostname -F /etc/hostname
+
+# Set system clock timezone
+export TZ='WIB-7'
+
+# Bring up loopback interface
+ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
+
+# Load kernel modules untuk NIC (urutan: dependency dulu)
+_KMOD="/lib/modules/$(uname -r)/kernel"
+insmod "$_KMOD/net/packet/af_packet.ko"     2>/dev/null || true
+insmod "$_KMOD/net/core/failover.ko"        2>/dev/null || true
+insmod "$_KMOD/drivers/net/net_failover.ko" 2>/dev/null || true
+insmod "$_KMOD/drivers/net/virtio_net.ko"   2>/dev/null || true
+insmod "$_KMOD/drivers/net/ethernet/intel/e1000/e1000.ko" 2>/dev/null || true
+
+# Bring up ethernet via DHCP
+# Tunggu kernel inisialisasi NIC setelah module di-load
+sleep 2
+
+# Ambil interface pertama selain lo dari /proc/net/dev
+_net_iface=$(sed -n 's/^ *\([^ :]*\):.*/\1/p' /proc/net/dev | grep -v '^lo$' | head -1)
+
+# Fallback ke nama interface umum
+if [ -z "$_net_iface" ]; then
+  for iface in eth0 enp0s3 ens3 eth1; do
+    ifconfig "$iface" up 2>/dev/null && _net_iface="$iface" && break
+  done
+fi
+
+if [ -n "$_net_iface" ]; then
+  ifconfig "$_net_iface" up 2>/dev/null || true
+  udhcpc -i "$_net_iface" -q -n -t 5 -T 3 \
+    -s /usr/share/udhcpc/default.script 2>/dev/null || true
+fi
+
+# Create essential /dev nodes if devtmpfs not available
+[ -c /dev/null ]    || mknod -m 666 /dev/null    c 1 3
+[ -c /dev/zero ]    || mknod -m 666 /dev/zero    c 1 5
+[ -c /dev/random ]  || mknod -m 444 /dev/random  c 1 8
+[ -c /dev/urandom ] || mknod -m 444 /dev/urandom c 1 9
+[ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
+[ -c /dev/tty ]     || mknod -m 666 /dev/tty     c 5 0
+[ -c /dev/tty0 ]    || mknod -m 620 /dev/tty0    c 4 0
+[ -c /dev/tty1 ]    || mknod -m 620 /dev/tty1    c 4 1
+[ -c /dev/tty2 ]    || mknod -m 620 /dev/tty2    c 4 2
+[ -c /dev/kmsg ]    || mknod -m 660 /dev/kmsg    c 1 11
+
+echo "Spark OS booted successfully."

@@ -1,0 +1,20 @@
+# /etc/inittab - BusyBox init configuration
+#
+# Format: id:runlevel:action:process
+
+# Boot sequence
+::sysinit:/etc/init.d/rcS
+
+# Main console shell
+console::askfirst:-/bin/sh
+
+# Fallback tty shells
+tty1::askfirst:-/bin/sh
+tty2::askfirst:-/bin/sh
+
+# Restart init on ctrl+alt+del
+::ctrlaltdel:/sbin/reboot
+
+# Cleanup on shutdown/reboot
+::shutdown:/bin/umount -a -r
+::shutdown:/sbin/swapoff -a

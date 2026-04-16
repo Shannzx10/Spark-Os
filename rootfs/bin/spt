@@ -1,0 +1,806 @@
+#!/bin/sh
+# ─────────────────────────────────────────────
+#  spt — Spark Package Tools v1.3
+#  Package manager for Spark OS
+#  Author: Shannz | sparkos.eu.cc
+# ─────────────────────────────────────────────
+
+SPT_VERSION="1.3"
+SPT_DIR="/var/lib/spt"
+SPT_CACHE="$SPT_DIR/cache"
+SPT_DB="$SPT_DIR/installed"
+SPT_CONF="/etc/spt/config"
+PACKAGES_FILE="$SPT_DIR/PACKAGES"
+
+REPO_URL="https://spt.sparkos.eu.cc"
+[ -f "$SPT_CONF" ] && . "$SPT_CONF"
+
+# Pilih download tool — curl lebih baik untuk HTTPS
+_CACERT="/etc/ssl/certs/ca-certificates.crt"
+if command -v curl >/dev/null 2>&1; then
+  if [ -f "$_CACERT" ]; then
+    _fetch() { curl -fsSL --cacert "$_CACERT" --max-time 300 -o "$2" "$1" 2>/dev/null; }
+  else
+    _fetch() { curl -fsSLk --max-time 300 -o "$2" "$1" 2>/dev/null; }
+  fi
+else
+  _fetch() { wget -q -O "$2" "$1" 2>/dev/null; }
+fi
+
+BLD='\033[1m'
+DIM='\033[2m'
+RE='\033[0m'
+
+need_root() {
+  [ "$(id -u)" -ne 0 ] && { echo "E: This command requires root."; exit 1; }
+}
+
+setup_dirs() { mkdir -p "$SPT_CACHE" "$SPT_DB"; }
+
+pkg_field() {
+  local PKG="$1" FIELD="$2"
+  awk -v pkg="$PKG" -v field="$FIELD" '
+    $0 == "Package: " pkg { found=1 }
+    found && index($0, field ": ") == 1 { sub(field ": ", ""); print; exit }
+    found && /^$/ { exit }
+  ' "$PACKAGES_FILE" 2>/dev/null
+}
+
+human_size() {
+  local b="$1"
+  if [ "$b" -ge 1048576 ]; then
+    printf "%d.%d MB" "$((b / 1048576))" "$(( (b % 1048576) * 10 / 1048576 ))"
+  elif [ "$b" -ge 1024 ]; then
+    printf "%d kB" "$((b / 1024))"
+  else
+    printf "%d B" "$b"
+  fi
+}
+
+draw_bar() {
+  local pct=$1 width=40 bar="" i=0
+  local filled=$((pct * width / 100))
+  while [ $i -lt $filled ]; do bar="${bar}#"; i=$((i + 1)); done
+  while [ $i -lt $width  ]; do bar="${bar}."; i=$((i + 1)); done
+  printf "\r  [%s] %3d%%" "$bar" "$pct"
+}
+
+download_pkg() {
+  local url=$1 dest=$2 size=$3
+  local tmp="${dest}.part" got=0 pct=0
+
+  _fetch "$url" "$tmp" &
+  local dl_pid=$!
+
+  while kill -0 "$dl_pid" 2>/dev/null; do
+    [ -f "$tmp" ] && got=$(stat -c%s "$tmp" 2>/dev/null || echo 0)
+    if [ "$size" -gt 0 ]; then
+      pct=$((got * 100 / size))
+      [ "$pct" -gt 99 ] && pct=99
+    fi
+    draw_bar "$pct"
+    sleep 1
+  done
+
+  wait "$dl_pid"
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    draw_bar 100; printf "\n"
+    mv "$tmp" "$dest"
+  else
+    printf "\n"; rm -f "$tmp"
+  fi
+  return "$rc"
+}
+
+# Check if a file is owned by any installed package
+# Returns 0 (owned) or 1 (not owned), sets OWNER_PKG
+is_owned() {
+  local FILE="$1" db FILES f
+  OWNER_PKG=""
+  for db in "$SPT_DB"/*; do
+    [ -f "$db" ] || continue
+    FILES=$(grep '^files=' "$db" | cut -d= -f2-)
+    for f in $FILES; do
+      if [ "$f" = "$FILE" ]; then
+        OWNER_PKG=$(grep '^name=' "$db" | cut -d= -f2)
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# Collect all packages to install (deps first) into global TO_INSTALL
+# REQUESTED_PKGS tracks what user explicitly asked for (vs auto-deps)
+TO_INSTALL=""
+REQUESTED_PKGS=""
+
+collect_deps() {
+  local PKG="$1" DEPS dep FN
+
+  [ -f "$SPT_DB/$PKG" ] && return 0
+
+  FN=$(pkg_field "$PKG" "Filename")
+  [ -z "$FN" ] && { echo "E: Package '$PKG' not found in index."; exit 1; }
+
+  DEPS=$(pkg_field "$PKG" "Depends")
+  for dep in $DEPS; do
+    collect_deps "$dep"
+  done
+
+  case " $TO_INSTALL " in
+    *" $PKG "*) ;;
+    *) TO_INSTALL="$TO_INSTALL $PKG" ;;
+  esac
+}
+
+install_single() {
+  local PKG=$1 IDX=$2
+  local FILENAME VERSION DESC DEPENDS SIZE PKG_URL PKG_FILE EXTRACT_DIR INSTALLED_FILES F
+  local AUTO=1
+
+  # Mark as manually installed if user explicitly requested it
+  case " $REQUESTED_PKGS " in *" $PKG "*) AUTO=0 ;; esac
+
+  FILENAME=$(pkg_field "$PKG" "Filename")
+  VERSION=$(pkg_field "$PKG"  "Version")
+  DESC=$(pkg_field "$PKG"     "Description")
+  DEPENDS=$(pkg_field "$PKG"  "Depends")
+  SIZE=$(pkg_field "$PKG"     "Size")
+  [ -z "$SIZE" ] && SIZE=0
+
+  # Local file install: FILENAME might be a local path
+  case "$FILENAME" in
+    /*)
+      PKG_FILE="$FILENAME"
+      printf "Inst:%d (local) %s %s\n" "$IDX" "$PKG" "$VERSION"
+      ;;
+    *)
+      printf "Get:%d %s %s %s [%s]\n" "$IDX" "$REPO_URL" "$PKG" "$VERSION" "$(human_size "$SIZE")"
+      PKG_URL="$REPO_URL/$FILENAME"
+      PKG_FILE="$SPT_CACHE/$(basename "$FILENAME")"
+      if ! download_pkg "$PKG_URL" "$PKG_FILE" "$SIZE"; then
+        echo "E: Failed to fetch $PKG_URL"; exit 1
+      fi
+      ;;
+  esac
+
+  EXTRACT_DIR="$SPT_CACHE/${PKG}_extract"
+  rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
+
+  if ! tar -xzf "$PKG_FILE" -C "$EXTRACT_DIR" 2>/dev/null; then
+    rm -rf "$EXTRACT_DIR"
+    [ "$PKG_FILE" != "$FILENAME" ] && rm -f "$PKG_FILE"
+    echo "E: Failed to unpack $PKG."; exit 1
+  fi
+
+  [ ! -f "$EXTRACT_DIR/PKGINFO" ] && {
+    rm -rf "$EXTRACT_DIR"
+    [ "$PKG_FILE" != "$FILENAME" ] && rm -f "$PKG_FILE"
+    echo "E: Invalid package: missing PKGINFO."; exit 1
+  }
+
+  # File conflict detection: warn about files not owned by any package
+  if [ -d "$EXTRACT_DIR/files" ]; then
+    local CONFLICTS=""
+    for F in $(find "$EXTRACT_DIR/files" -type f | sed "s|$EXTRACT_DIR/files||"); do
+      if [ -f "$F" ] && ! is_owned "$F"; then
+        CONFLICTS="$CONFLICTS $F"
+      fi
+    done
+    if [ -n "$CONFLICTS" ]; then
+      printf "W: The following files will be overwritten (not tracked by spt):\n"
+      for F in $CONFLICTS; do printf "     %s\n" "$F"; done
+    fi
+  fi
+
+  printf "Selecting previously unselected package %s.\n" "$PKG"
+
+  [ -f "$EXTRACT_DIR/scripts/pre-install.sh" ] && \
+    sh "$EXTRACT_DIR/scripts/pre-install.sh" 2>/dev/null
+
+  printf "Preparing to unpack %s...\n" "$PKG"
+  printf "Unpacking %s (%s)...\n" "$PKG" "$VERSION"
+
+  INSTALLED_FILES=""
+  if [ -d "$EXTRACT_DIR/files" ]; then
+    INSTALLED_FILES=$(find "$EXTRACT_DIR/files" -type f \
+      | sed "s|$EXTRACT_DIR/files||")
+    cp -r "$EXTRACT_DIR/files/." /
+    for F in $INSTALLED_FILES; do
+      case "$F" in
+        /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*) chmod +x "$F" 2>/dev/null ;;
+      esac
+    done
+  fi
+
+  printf "Setting up %s (%s)...\n" "$PKG" "$VERSION"
+
+  [ -f "$EXTRACT_DIR/scripts/post-install.sh" ] && \
+    sh "$EXTRACT_DIR/scripts/post-install.sh" 2>/dev/null
+
+  {
+    echo "name=$PKG"
+    echo "version=$VERSION"
+    echo "auto=$AUTO"
+    echo "description=$DESC"
+    echo "depends=$DEPENDS"
+    echo "installed_at=$(date '+%Y-%m-%d %H:%M')"
+    echo "files=$INSTALLED_FILES"
+  } > "$SPT_DB/$PKG"
+
+  rm -rf "$EXTRACT_DIR"
+  # Only remove downloaded cache file, not local files
+  case "$FILENAME" in /*) ;; *) rm -f "$PKG_FILE" ;; esac
+}
+
+# Parse common -y flag and package args
+parse_args() {
+  YES=0; PKGS=""
+  for arg in "$@"; do
+    case "$arg" in
+      -y|--yes) YES=1 ;;
+      -*)       echo "E: Unknown option: $arg"; exit 1 ;;
+      *)        PKGS="$PKGS $arg" ;;
+    esac
+  done
+}
+
+confirm() {
+  [ "$YES" -eq 1 ] && return 0
+  printf "Do you want to continue? [Y/n] "
+  read REPLY
+  case "$REPLY" in
+    n|N|no|NO) printf "Abort.\n"; return 1 ;;
+  esac
+  return 0
+}
+
+# ── spt update ────────────────────────────────
+cmd_update() {
+  local ARCH COUNT
+  ARCH=$(uname -m)
+  printf "Reading package lists..."
+  mkdir -p "$SPT_DIR"
+  if _fetch "$REPO_URL/$ARCH/PACKAGES" "$PACKAGES_FILE.tmp"; then
+    mv "$PACKAGES_FILE.tmp" "$PACKAGES_FILE"
+    COUNT=$(grep -c '^Package:' "$PACKAGES_FILE" 2>/dev/null || echo 0)
+    printf " Done\n"
+    printf "${DIM}%s packages available.${RE}\n" "$COUNT"
+  else
+    printf " Failed\n"
+    echo "E: Unable to reach: $REPO_URL/$ARCH/PACKAGES"
+    rm -f "$PACKAGES_FILE.tmp"; exit 1
+  fi
+}
+
+# ── spt install ───────────────────────────────
+cmd_install() {
+  local YES=0 PKGS="" LOCAL_PKGS="" arg p sz
+
+  for arg in "$@"; do
+    case "$arg" in
+      -y|--yes) YES=1 ;;
+      -*)       echo "E: Unknown option: $arg"; exit 1 ;;
+      *.spk)
+        if [ -f "$arg" ]; then LOCAL_PKGS="$LOCAL_PKGS $arg"
+        else echo "E: File not found: $arg"; exit 1; fi ;;
+      *)        PKGS="$PKGS $arg" ;;
+    esac
+  done
+
+  need_root; setup_dirs
+
+  [ -z "$PKGS" ] && [ -z "$LOCAL_PKGS" ] && {
+    echo "E: Package name required.  Usage: spt install <package...>"; exit 1
+  }
+
+  # Handle local .spk installs
+  for arg in $LOCAL_PKGS; do
+    local LNAME LVER
+    LNAME=$(tar -xzOf "$arg" PKGINFO 2>/dev/null | grep '^name=' | cut -d= -f2)
+    LVER=$(tar -xzOf  "$arg" PKGINFO 2>/dev/null | grep '^version=' | cut -d= -f2)
+    [ -z "$LNAME" ] && { echo "E: Invalid package file: $arg"; exit 1; }
+    if [ -f "$SPT_DB/$LNAME" ]; then
+      printf "%s is already installed. Use reinstall to force.\n" "$LNAME"
+      continue
+    fi
+    printf "\nInstalling local package: %s (%s)\n\n" "$LNAME" "$LVER"
+    # Inject a fake PACKAGES entry so install_single can read fields
+    REQUESTED_PKGS="$REQUESTED_PKGS $LNAME"
+    # install directly without collect_deps (local pkg)
+    local REAL_PACKAGES="$PACKAGES_FILE"
+    PACKAGES_FILE="/dev/null"
+    # Build a temp PKGINFO ref — use a custom install path
+    local LTMP="$SPT_CACHE/${LNAME}_local.spk"
+    cp "$arg" "$LTMP"
+    EXTRACT_DIR="$SPT_CACHE/${LNAME}_extract"
+    rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
+    tar -xzf "$LTMP" -C "$EXTRACT_DIR" 2>/dev/null
+    PACKAGES_FILE="$REAL_PACKAGES"
+    # Re-read fields from extracted PKGINFO
+    local PKGINFO_FILE="$EXTRACT_DIR/PKGINFO"
+    [ ! -f "$PKGINFO_FILE" ] && { echo "E: Invalid package: missing PKGINFO."; rm -rf "$EXTRACT_DIR" "$LTMP"; exit 1; }
+    local LNAME2 LVER2 LDESC LDEPS LFILES LF
+    LNAME2=$(grep '^name='        "$PKGINFO_FILE" | cut -d= -f2)
+    LVER2=$(grep  '^version='     "$PKGINFO_FILE" | cut -d= -f2)
+    LDESC=$(grep  '^description=' "$PKGINFO_FILE" | cut -d= -f2)
+    LDEPS=$(grep  '^depends='     "$PKGINFO_FILE" | cut -d= -f2)
+    printf "Selecting previously unselected package %s.\n" "$LNAME2"
+    [ -f "$EXTRACT_DIR/scripts/pre-install.sh" ] && sh "$EXTRACT_DIR/scripts/pre-install.sh" 2>/dev/null
+    printf "Preparing to unpack %s...\n" "$LNAME2"
+    printf "Unpacking %s (%s)...\n" "$LNAME2" "$LVER2"
+    LFILES=""
+    if [ -d "$EXTRACT_DIR/files" ]; then
+      LFILES=$(find "$EXTRACT_DIR/files" -type f | sed "s|$EXTRACT_DIR/files||")
+      cp -r "$EXTRACT_DIR/files/." /
+      for LF in $LFILES; do
+        case "$LF" in /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*) chmod +x "$LF" 2>/dev/null ;; esac
+      done
+    fi
+    printf "Setting up %s (%s)...\n" "$LNAME2" "$LVER2"
+    [ -f "$EXTRACT_DIR/scripts/post-install.sh" ] && sh "$EXTRACT_DIR/scripts/post-install.sh" 2>/dev/null
+    { echo "name=$LNAME2"; echo "version=$LVER2"; echo "auto=0"
+      echo "description=$LDESC"; echo "depends=$LDEPS"
+      echo "installed_at=$(date '+%Y-%m-%d %H:%M')"
+      echo "files=$LFILES"; } > "$SPT_DB/$LNAME2"
+    rm -rf "$EXTRACT_DIR" "$LTMP"
+    printf "\nDone.\n\n"
+  done
+
+  [ -z "$PKGS" ] && return 0
+
+  [ ! -f "$PACKAGES_FILE" ] && { echo "E: Package index not found. Run: spt update"; exit 1; }
+
+  # Report already-installed
+  for p in $PKGS; do
+    if [ -f "$SPT_DB/$p" ]; then
+      local v; v=$(grep '^version=' "$SPT_DB/$p" | cut -d= -f2)
+      printf "%s is already the newest version (%s).\n" "$p" "$v"
+    fi
+  done
+
+  # Collect deps
+  TO_INSTALL=""; REQUESTED_PKGS=""
+  for p in $PKGS; do
+    REQUESTED_PKGS="$REQUESTED_PKGS $p"
+  done
+  for p in $PKGS; do
+    [ -f "$SPT_DB/$p" ] && continue
+    collect_deps "$p"
+  done
+
+  [ -z "$TO_INSTALL" ] && return 0
+
+  local count=0 total_size=0
+  for p in $TO_INSTALL; do
+    count=$((count + 1))
+    sz=$(pkg_field "$p" "Size"); [ -z "$sz" ] && sz=0
+    total_size=$((total_size + sz))
+  done
+
+  printf "\nThe following NEW packages will be installed:\n  "
+  for p in $TO_INSTALL; do printf "%s " "$p"; done
+  printf "\n\n"
+  printf "0 upgraded, %d newly installed, 0 to remove.\n" "$count"
+  printf "Need to get %s of archives.\n" "$(human_size "$total_size")"
+
+  confirm || return 1
+  printf "\n"
+
+  local i=1
+  for p in $TO_INSTALL; do
+    install_single "$p" "$i"
+    i=$((i + 1))
+  done
+
+  printf "\nDone.\n\n"
+}
+
+# ── spt remove ────────────────────────────────
+cmd_remove() {
+  local YES=0 PKGS="" TO_REMOVE="" arg p
+
+  for arg in "$@"; do
+    case "$arg" in
+      -y|--yes) YES=1 ;;
+      -*)       echo "E: Unknown option: $arg"; exit 1 ;;
+      *)        PKGS="$PKGS $arg" ;;
+    esac
+  done
+
+  need_root
+  [ -z "$PKGS" ] && { echo "E: Package name required.  Usage: spt remove <package...>"; exit 1; }
+
+  for p in $PKGS; do
+    [ ! -f "$SPT_DB/$p" ] && { echo "E: '$p' is not installed."; exit 1; }
+    case " $TO_REMOVE " in *" $p "*) ;; *) TO_REMOVE="$TO_REMOVE $p" ;; esac
+  done
+
+  local count=0
+  for p in $TO_REMOVE; do count=$((count + 1)); done
+
+  printf "\nThe following packages will be REMOVED:\n  "
+  for p in $TO_REMOVE; do printf "%s " "$p"; done
+  printf "\n\n"
+  printf "0 upgraded, 0 newly installed, %d to remove.\n" "$count"
+
+  confirm || return 1
+  printf "\n"
+
+  local VER FILES F
+  for p in $TO_REMOVE; do
+    VER=$(grep '^version=' "$SPT_DB/$p" | cut -d= -f2)
+    printf "Removing %s (%s)...\n" "$p" "$VER"
+    FILES=$(grep '^files=' "$SPT_DB/$p" | cut -d= -f2-)
+    for F in $FILES; do [ -f "$F" ] && rm -f "$F"; done
+    rm -f "$SPT_DB/$p"
+  done
+
+  printf "Done.\n\n"
+}
+
+# ── spt reinstall ─────────────────────────────
+cmd_reinstall() {
+  local YES=0 PKGS="" arg p
+
+  for arg in "$@"; do
+    case "$arg" in
+      -y|--yes) YES=1 ;;
+      -*)       echo "E: Unknown option: $arg"; exit 1 ;;
+      *)        PKGS="$PKGS $arg" ;;
+    esac
+  done
+
+  need_root; setup_dirs
+  [ -z "$PKGS" ] && { echo "E: Package name required.  Usage: spt reinstall <package...>"; exit 1; }
+  [ ! -f "$PACKAGES_FILE" ] && { echo "E: Package index not found. Run: spt update"; exit 1; }
+
+  for p in $PKGS; do
+    local FN; FN=$(pkg_field "$p" "Filename")
+    [ -z "$FN" ] && { echo "E: Package '$p' not found in index."; exit 1; }
+  done
+
+  local count=0 total_size=0 sz
+  for p in $PKGS; do
+    count=$((count + 1))
+    sz=$(pkg_field "$p" "Size"); [ -z "$sz" ] && sz=0
+    total_size=$((total_size + sz))
+  done
+
+  printf "\nThe following packages will be REINSTALLED:\n  "
+  for p in $PKGS; do printf "%s " "$p"; done
+  printf "\n\n"
+  printf "Need to get %s of archives.\n" "$(human_size "$total_size")"
+
+  confirm || return 1
+  printf "\n"
+
+  REQUESTED_PKGS=""
+  for p in $PKGS; do REQUESTED_PKGS="$REQUESTED_PKGS $p"; done
+
+  local i=1 VER FILES F
+  for p in $PKGS; do
+    # Remove existing files if installed
+    if [ -f "$SPT_DB/$p" ]; then
+      FILES=$(grep '^files=' "$SPT_DB/$p" | cut -d= -f2-)
+      for F in $FILES; do [ -f "$F" ] && rm -f "$F"; done
+      rm -f "$SPT_DB/$p"
+    fi
+    install_single "$p" "$i"
+    i=$((i + 1))
+  done
+
+  printf "\nDone.\n\n"
+}
+
+# ── spt autoremove ────────────────────────────
+cmd_autoremove() {
+  local YES=0 arg
+  for arg in "$@"; do
+    case "$arg" in -y|--yes) YES=1 ;; esac
+  done
+
+  need_root
+
+  local ORPHANS="" F NAME AUTO DEPS dep NEEDED G GDEPS gdep
+  for F in "$SPT_DB"/*; do
+    [ -f "$F" ] || continue
+    AUTO=$(grep '^auto=' "$F" | cut -d= -f2)
+    [ "$AUTO" != "1" ] && continue
+    NAME=$(grep '^name=' "$F" | cut -d= -f2)
+
+    # Check if any installed package depends on this
+    NEEDED=0
+    for G in "$SPT_DB"/*; do
+      [ -f "$G" ] || continue
+      GDEPS=$(grep '^depends=' "$G" | cut -d= -f2-)
+      for gdep in $GDEPS; do
+        [ "$gdep" = "$NAME" ] && NEEDED=1 && break
+      done
+      [ "$NEEDED" -eq 1 ] && break
+    done
+
+    [ "$NEEDED" -eq 0 ] && ORPHANS="$ORPHANS $NAME"
+  done
+
+  if [ -z "$ORPHANS" ]; then
+    echo "No packages to autoremove."
+    return 0
+  fi
+
+  local count=0 p
+  for p in $ORPHANS; do count=$((count + 1)); done
+
+  printf "\nThe following packages were automatically installed and are no longer needed:\n  "
+  for p in $ORPHANS; do printf "%s " "$p"; done
+  printf "\n\n%d to remove.\n" "$count"
+
+  confirm || return 1
+  printf "\n"
+
+  local VER FILES fx
+  for p in $ORPHANS; do
+    VER=$(grep '^version=' "$SPT_DB/$p" | cut -d= -f2)
+    printf "Removing %s (%s)...\n" "$p" "$VER"
+    FILES=$(grep '^files=' "$SPT_DB/$p" | cut -d= -f2-)
+    for fx in $FILES; do [ -f "$fx" ] && rm -f "$fx"; done
+    rm -f "$SPT_DB/$p"
+  done
+
+  printf "Done.\n\n"
+}
+
+# ── spt clean ─────────────────────────────────
+cmd_clean() {
+  local SIZE
+  SIZE=$(du -sh "$SPT_CACHE" 2>/dev/null | cut -f1)
+  printf "Clearing download cache (%s)...\n" "${SIZE:-0}"
+  rm -f "$SPT_CACHE"/*.spk "$SPT_CACHE"/*.part 2>/dev/null
+  rm -rf "$SPT_CACHE"/*_extract 2>/dev/null
+  printf "Done.\n"
+}
+
+# ── spt owns ──────────────────────────────────
+cmd_owns() {
+  local FILE="$1"
+  [ -z "$FILE" ] && { echo "E: File path required.  Usage: spt owns <file>"; exit 1; }
+
+  # Normalize to absolute path
+  case "$FILE" in /*) ;; *) FILE="$(pwd)/$FILE" ;; esac
+
+  local FOUND=0 db FILES f NAME VER
+  for db in "$SPT_DB"/*; do
+    [ -f "$db" ] || continue
+    FILES=$(grep '^files=' "$db" | cut -d= -f2-)
+    for f in $FILES; do
+      if [ "$f" = "$FILE" ]; then
+        NAME=$(grep '^name='    "$db" | cut -d= -f2)
+        VER=$(grep  '^version=' "$db" | cut -d= -f2)
+        printf "%s: %s (%s)\n" "$FILE" "$NAME" "$VER"
+        FOUND=1
+      fi
+    done
+  done
+
+  [ "$FOUND" -eq 0 ] && printf "W: %s is not owned by any spt package.\n" "$FILE"
+  return 0
+}
+
+# ── spt depends ───────────────────────────────
+cmd_depends() {
+  local PKG="$1"
+  [ -z "$PKG" ] && { echo "E: Package name required.  Usage: spt depends <package>"; exit 1; }
+  [ ! -f "$PACKAGES_FILE" ] && { echo "E: Package index not found. Run: spt update"; exit 1; }
+
+  local FN; FN=$(pkg_field "$PKG" "Filename")
+  [ -z "$FN" ] && { echo "E: Package '$PKG' not found in index."; exit 1; }
+
+  local DEPS
+  DEPS=$(pkg_field "$PKG" "Depends")
+
+  printf "\n%s\n" "$PKG"
+  if [ -z "$DEPS" ]; then
+    printf "  (no dependencies)\n"
+  else
+    for dep in $DEPS; do
+      local INST=""
+      [ -f "$SPT_DB/$dep" ] && INST=" [installed]"
+      printf "  Depends: %s%s\n" "$dep" "$INST"
+      # Show transitive deps indented
+      local SUBDEPS; SUBDEPS=$(pkg_field "$dep" "Depends")
+      for subdep in $SUBDEPS; do
+        local SINST=""
+        [ -f "$SPT_DB/$subdep" ] && SINST=" [installed]"
+        printf "    Depends: %s%s\n" "$subdep" "$SINST"
+      done
+    done
+  fi
+  printf "\n"
+}
+
+# ── spt list ──────────────────────────────────
+cmd_list() {
+  if [ ! -d "$SPT_DB" ] || [ -z "$(ls -A "$SPT_DB" 2>/dev/null)" ]; then
+    echo "No packages installed."; return
+  fi
+
+  local COUNT=0 F NAME VER DESC DATE AUTO ATAG
+  printf "\n  %-18s %-12s %-30s %s\n" "Package" "Version" "Description" "Installed"
+  printf "  %s\n" "──────────────────────────────────────────────────────────────────"
+  for F in "$SPT_DB"/*; do
+    [ -f "$F" ] || continue
+    NAME=$(grep '^name='         "$F" | cut -d= -f2)
+    VER=$(grep  '^version='      "$F" | cut -d= -f2)
+    DESC=$(grep '^description='  "$F" | cut -d= -f2)
+    DATE=$(grep '^installed_at=' "$F" | cut -d= -f2 | cut -d' ' -f1)
+    AUTO=$(grep '^auto='         "$F" | cut -d= -f2)
+    [ "$AUTO" = "1" ] && ATAG=" [auto]" || ATAG=""
+    printf "  %-18s %-12s %-30s %s%s\n" "$NAME" "$VER" "$DESC" "$DATE" "$ATAG"
+    COUNT=$((COUNT + 1))
+  done
+  printf "\n  %d package(s) installed.\n\n" "$COUNT"
+}
+
+# ── spt search ────────────────────────────────
+cmd_search() {
+  local Q="$1"
+  [ -z "$Q" ] && { echo "E: Search term required.  Usage: spt search <query>"; exit 1; }
+  [ ! -f "$PACKAGES_FILE" ] && { echo "E: Package index not found. Run: spt update"; exit 1; }
+
+  printf "\n  %-18s %-12s %s\n" "Package" "Version" "Description"
+  printf "  %s\n" "──────────────────────────────────────────────────"
+  awk -v q="$Q" '
+    /^Package:/    { pkg=$2 }
+    /^Version:/    { ver=substr($0,10) }
+    /^Description:/{ desc=substr($0,14) }
+    /^$/ {
+      if ((index(pkg,q)>0 || index(desc,q)>0) && pkg != "")
+        printf "  %-18s %-12s %s\n", pkg, ver, desc
+      pkg=""; ver=""; desc=""
+    }
+  ' "$PACKAGES_FILE"
+  printf "\n"
+}
+
+# ── spt info ──────────────────────────────────
+cmd_info() {
+  local PKG="$1" INST_VER="" AUTO=""
+  [ -z "$PKG" ] && { echo "E: Package name required.  Usage: spt info <package>"; exit 1; }
+  [ ! -f "$PACKAGES_FILE" ] && { echo "E: Package index not found. Run: spt update"; exit 1; }
+
+  if [ -f "$SPT_DB/$PKG" ]; then
+    INST_VER=$(grep '^version=' "$SPT_DB/$PKG" | cut -d= -f2)
+    AUTO=$(grep '^auto=' "$SPT_DB/$PKG" | cut -d= -f2)
+  fi
+
+  printf "\n"
+  awk -v p="$PKG" -v inst="$INST_VER" -v auto="$AUTO" '
+    /^Package: / && $2==p { found=1 }
+    found {
+      if (/^Package:/)     printf "  Package     : %s\n", $2
+      if (/^Version:/)     printf "  Version     : %s\n", substr($0,10)
+      if (/^Arch:/)        printf "  Arch        : %s\n", substr($0,7)
+      if (/^Description:/) printf "  Description : %s\n", substr($0,14)
+      if (/^Depends:/)     printf "  Depends     : %s\n", substr($0,10)
+      if (/^Size:/)        printf "  Size        : %s bytes\n", substr($0,7)
+      if (/^Maintainer:/)  printf "  Maintainer  : %s\n", substr($0,13)
+      if (/^$/) {
+        if (inst != "") {
+          tag = (auto == "1") ? " [auto]" : ""
+          printf "  Installed   : Yes (%s)%s\n", inst, tag
+        } else {
+          printf "  Installed   : No\n"
+        }
+        found=0
+      }
+    }
+  ' "$PACKAGES_FILE"
+  printf "\n"
+}
+
+# ── spt upgrade ───────────────────────────────
+cmd_upgrade() {
+  local YES=0 arg
+  for arg in "$@"; do
+    case "$arg" in -y|--yes) YES=1 ;; esac
+  done
+
+  need_root
+  [ ! -f "$PACKAGES_FILE" ] && { echo "E: Run: spt update first."; exit 1; }
+
+  printf "Calculating upgrades..."
+  local UPGRADES="" NAME INST_VER REPO_VER F
+  for F in "$SPT_DB"/*; do
+    [ -f "$F" ] || continue
+    NAME=$(grep '^name=' "$F" | cut -d= -f2)
+    INST_VER=$(grep '^version=' "$F" | cut -d= -f2)
+    REPO_VER=$(pkg_field "$NAME" "Version")
+    if [ -n "$REPO_VER" ] && [ "$REPO_VER" != "$INST_VER" ]; then
+      UPGRADES="$UPGRADES $NAME"
+    fi
+  done
+  printf " Done\n"
+
+  if [ -z "$UPGRADES" ]; then
+    echo "All packages are up to date."
+    return 0
+  fi
+
+  local count=0 p
+  for p in $UPGRADES; do count=$((count + 1)); done
+
+  printf "\nThe following packages will be upgraded:\n  "
+  for p in $UPGRADES; do printf "%s " "$p"; done
+  printf "\n\n%d upgraded, 0 newly installed, 0 to remove.\n" "$count"
+
+  confirm || return 1
+  printf "\n"
+
+  REQUESTED_PKGS=""
+  for p in $UPGRADES; do REQUESTED_PKGS="$REQUESTED_PKGS $p"; done
+
+  local VER FILES fx iv rv
+  for p in $UPGRADES; do
+    iv=$(grep '^version=' "$SPT_DB/$p" | cut -d= -f2)
+    rv=$(pkg_field "$p" "Version")
+    printf "Preparing to upgrade %s (%s => %s)...\n" "$p" "$iv" "$rv"
+    FILES=$(grep '^files=' "$SPT_DB/$p" | cut -d= -f2-)
+    for fx in $FILES; do [ -f "$fx" ] && rm -f "$fx"; done
+    rm -f "$SPT_DB/$p"
+    TO_INSTALL=""
+    collect_deps "$p"
+    local i=1
+    for dep in $TO_INSTALL; do
+      install_single "$dep" "$i"
+      i=$((i + 1))
+    done
+  done
+
+  printf "\nDone.\n\n"
+}
+
+# ── spt help ──────────────────────────────────
+cmd_help() {
+  printf "\nUsage: spt <command> [options]\n\n"
+  printf "  %-32s %s\n" "update"                    "Update package index"
+  printf "  %-32s %s\n" "install [-y] <pkg...>"     "Install one or more packages"
+  printf "  %-32s %s\n" "install [-y] <file.spk>"   "Install from local file"
+  printf "  %-32s %s\n" "remove  [-y] <pkg...>"     "Remove one or more packages"
+  printf "  %-32s %s\n" "reinstall [-y] <pkg...>"   "Force reinstall packages"
+  printf "  %-32s %s\n" "upgrade [-y]"              "Upgrade all installed packages"
+  printf "  %-32s %s\n" "autoremove [-y]"           "Remove unused auto-installed packages"
+  printf "  %-32s %s\n" "clean"                     "Clear download cache"
+  printf "  %-32s %s\n" "list"                      "List installed packages"
+  printf "  %-32s %s\n" "search <query>"            "Search available packages"
+  printf "  %-32s %s\n" "info <package>"            "Show package details"
+  printf "  %-32s %s\n" "depends <package>"         "Show package dependencies"
+  printf "  %-32s %s\n" "owns <file>"               "Find which package owns a file"
+  printf "\n  ${DIM}-y, --yes    Skip confirmation prompt${RE}\n"
+  printf "\nSpark Package Tools v%s — sparkos.eu.cc\n\n" "$SPT_VERSION"
+}
+
+# ── Main ──────────────────────────────────────
+CMD="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$CMD" in
+  update)               cmd_update ;;
+  install)              cmd_install "$@" ;;
+  remove|uninstall)     cmd_remove "$@" ;;
+  reinstall)            cmd_reinstall "$@" ;;
+  autoremove)           cmd_autoremove "$@" ;;
+  upgrade)              cmd_upgrade "$@" ;;
+  clean)                cmd_clean ;;
+  list|ls)              cmd_list ;;
+  search)               cmd_search "$1" ;;
+  info)                 cmd_info "$1" ;;
+  depends)              cmd_depends "$1" ;;
+  owns)                 cmd_owns "$1" ;;
+  version|-v|--version) echo "spt $SPT_VERSION" ;;
+  help|--help|-h)       cmd_help ;;
+  *)
+    echo "E: Unknown command: '$CMD'"
+    cmd_help; exit 1 ;;
+esac
