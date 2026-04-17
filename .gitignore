@@ -1,0 +1,46 @@
+# Virtual filesystems - jangan di-commit
+rootfs/proc/*
+rootfs/sys/*
+rootfs/dev/*
+rootfs/run/*
+rootfs/tmp/*
+!rootfs/run/.gitkeep
+!rootfs/tmp/.gitkeep
+
+# SPT runtime data (installed packages, cache, index)
+rootfs/var/lib/spt/
+rootfs/var/lib/
+rootfs/var/
+
+# Libraries installed via spt (install via spt, not bundled in repo)
+# rootfs/lib/modules/ dikecualikan karena perlu di-commit (kernel modules)
+rootfs/lib/*.so*
+rootfs/lib/ld-musl*.so*
+
+# Packages installed via spt (jangan commit binary hasil install)
+rootfs/usr/bin/bash
+rootfs/usr/bin/jq
+rootfs/usr/bin/btm
+
+# Log files
+rootfs/var/log/*
+rootfs/var/run/*
+
+# Shell history
+rootfs/root/.ash_history
+rootfs/home/*/.ash_history
+
+# Sisa direktori virtual di root repo
+/proc/
+/sys/
+/dev/
+/run/
+/tmp/
+
+# File hasil build ISO (besar, tidak perlu di-commit)
+targets/iso/boot/vmlinuz
+targets/iso/boot/initrd.img
+*.iso
+
+# Claude Code internal files
+.claude/
